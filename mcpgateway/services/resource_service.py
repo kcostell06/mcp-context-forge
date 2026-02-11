@@ -41,7 +41,7 @@ import parse
 from pydantic import ValidationError
 from sqlalchemy import and_, delete, desc, not_, or_, select
 from sqlalchemy.exc import IntegrityError, OperationalError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import joinedload, Session
 
 # First-Party
 from mcpgateway.common.models import ResourceContent, ResourceTemplate, TextContent
@@ -1009,7 +1009,7 @@ class ResourceService:
 
         # Apply team-based access control if user_email is provided OR token_teams is explicitly set
         # This ensures unauthenticated requests with token_teams=[] only see public resources
-        if user_email or token_teams is not None:
+        if user_email is not None or token_teams is not None:  # empty-string user_email -> public-only filtering (secure default)
             # Use token_teams if provided (for MCP/API token access), otherwise look up from DB
             if token_teams is not None:
                 team_ids = token_teams
@@ -1300,7 +1300,7 @@ class ResourceService:
 
         # Add visibility filtering if user context OR token_teams provided
         # This ensures unauthenticated requests with token_teams=[] only see public resources
-        if user_email or token_teams is not None:
+        if user_email is not None or token_teams is not None:  # empty-string user_email -> public-only filtering (secure default)
             # Use token_teams if provided (for MCP/API token access), otherwise look up from DB
             if token_teams is not None:
                 team_ids = token_teams
@@ -1417,6 +1417,8 @@ class ResourceService:
         resource_template_uri: Optional[str] = None,
         user_identity: Optional[Union[str, Dict[str, Any]]] = None,
         meta_data: Optional[Dict[str, Any]] = None,  # Reserved for future MCP SDK support
+        resource_obj: Optional[Any] = None,
+        gateway_obj: Optional[Any] = None,
     ) -> Any:
         """
         Invoke a resource via its configured gateway using SSE or StreamableHTTP transport.
@@ -1449,6 +1451,10 @@ class ResourceService:
                 OAuth token lookup always uses platform_admin_email (service account).
             meta_data (Optional[Dict[str, Any]]):
                 Additional metadata to pass to the gateway during invocation.
+            resource_obj (Optional[Any]):
+                Pre-fetched DbResource object to skip the internal resource lookup query.
+            gateway_obj (Optional[Any]):
+                Pre-fetched DbGateway object to skip the internal gateway lookup query.
 
         Returns:
             Any: The text content returned by the remote resource, or ``None`` if the
@@ -1527,8 +1533,10 @@ class ResourceService:
 
         logger.info(f"Invoking the resource: {uri}")
         gateway_id = None
-        resource_info = None
-        resource_info = db.execute(select(DbResource).where(DbResource.id == resource_id)).scalar_one_or_none()
+        # Use pre-fetched resource if provided (avoids Q5 re-fetch)
+        resource_info = resource_obj
+        if resource_info is None:
+            resource_info = db.execute(select(DbResource).where(DbResource.id == resource_id)).scalar_one_or_none()
 
         # Release transaction immediately after resource lookup to prevent idle-in-transaction
         # This is especially important when resource isn't found - we don't want to hold the transaction
@@ -1549,8 +1557,9 @@ class ResourceService:
         if resource_info:
             gateway_id = getattr(resource_info, "gateway_id", None)
             resource_name = getattr(resource_info, "name", None)
-            gateway = None
-            if gateway_id:
+            # Use pre-fetched gateway if provided (avoids Q6 re-fetch)
+            gateway = gateway_obj
+            if gateway is None and gateway_id:
                 gateway = db.execute(select(DbGateway).where(DbGateway.id == gateway_id)).scalar_one_or_none()
 
             # ═══════════════════════════════════════════════════════════════════════════
@@ -2027,11 +2036,20 @@ class ResourceService:
         success = False
         error_message = None
         resource_db = None
+        resource_db_gateway = None  # Only set when eager-loaded via Q2's joinedload
         content = None
         uri = resource_uri or "unknown"
         if resource_id:
-            resource_db = db.get(DbResource, resource_id)
-            uri = resource_db.uri if resource_db else None
+            resource_db = db.get(DbResource, resource_id, options=[joinedload(DbResource.gateway)])
+            if resource_db:
+                uri = resource_db.uri
+                resource_db_gateway = resource_db.gateway  # Eager-loaded, safe to access
+                # Check enabled status in Python (avoids redundant Q3/Q4 re-fetches)
+                if not include_inactive and not resource_db.enabled:
+                    raise ResourceNotFoundError(f"Resource '{resource_id}' exists but is inactive")
+                content = resource_db.content
+            else:
+                uri = None
 
         # Create database span for observability dashboard
         trace_id = current_trace_id.get()
@@ -2147,7 +2165,7 @@ class ResourceService:
                 logger.info(f"Fetching resource: {resource_id} (URI: {uri})")
                 # Check for template
 
-                if uri is not None:  # and "{" in uri and "}" in uri:
+                if resource_db is None and uri is not None:  # and "{" in uri and "}" in uri:
                     # Matches uri (modified value from pluggins if applicable)
                     # with uri from resource DB
                     # if uri is of type resource template then resource is retreived from DB
@@ -2189,9 +2207,9 @@ class ResourceService:
                     if content is None and resource_db is None:
                         raise ResourceNotFoundError(f"Resource template not found for '{resource_uri}'")
 
-                if resource_id:
-                    # if resource_id provided instead of resource_uri
-                    # retrieves resource based on resource_id
+                if resource_id and resource_db is None:
+                    # if resource_id provided but not found by Q2 (shouldn't normally happen,
+                    # but handles race conditions where resource is deleted between requests)
                     query = select(DbResource).where(DbResource.id == str(resource_id)).where(DbResource.enabled)
                     if include_inactive:
                         query = select(DbResource).where(DbResource.id == str(resource_id))
@@ -2227,22 +2245,6 @@ class ResourceService:
                         if not server_match:
                             raise ResourceNotFoundError(f"Resource not found: {resource_uri or resource_id}")
 
-                # Release transaction before network calls to avoid idle-in-transaction during invoke_resource
-                db.commit()
-
-                # Call post-fetch hooks if registered
-                if has_post_fetch:
-                    # Create post-fetch payload
-                    post_payload = ResourcePostFetchPayload(uri=original_uri, content=content)
-                    # Execute post-fetch hooks
-                    post_result, _ = await self._plugin_manager.invoke_hook(
-                        ResourceHookType.RESOURCE_POST_FETCH, post_payload, global_context, contexts, violations_as_exceptions=True
-                    )  # Pass contexts from pre-fetch
-
-                    # Use modified content if plugin changed it
-                    if post_result.modified_payload:
-                        content = post_result.modified_payload.content
-
                 # Set success attributes on span
                 if span:
                     span.set_attribute("success", True)
@@ -2255,7 +2257,14 @@ class ResourceService:
                 # Prefer returning first-class content models or objects with content-like attributes.
                 # ResourceContent and TextContent already imported at top level
 
-                # If content is already a Pydantic content model, return as-is
+                # Release transaction before network calls to avoid idle-in-transaction during invoke_resource
+                db.commit()
+
+                # ═══════════════════════════════════════════════════════════════════════════
+                # RESOLVE CONTENT: Fetch actual content from gateway if needed
+                # ═══════════════════════════════════════════════════════════════════════════
+                # If content is a Pydantic content model, invoke gateway
+
                 if isinstance(content, (ResourceContent, TextContent)):
                     resource_response = await self.invoke_resource(
                         db=db,
@@ -2264,12 +2273,13 @@ class ResourceService:
                         resource_template_uri=getattr(content, "text") or None,
                         user_identity=user,
                         meta_data=meta_data,
+                        resource_obj=resource_db,
+                        gateway_obj=resource_db_gateway,
                     )
                     if resource_response:
                         setattr(content, "text", resource_response)
-                    return content
-                # If content is any object that quacks like content (e.g., MagicMock with .text/.blob), return as-is
-                if hasattr(content, "text") or hasattr(content, "blob"):
+                # If content is any object that quacks like content
+                elif hasattr(content, "text") or hasattr(content, "blob"):
                     if hasattr(content, "blob"):
                         resource_response = await self.invoke_resource(
                             db=db,
@@ -2278,8 +2288,11 @@ class ResourceService:
                             resource_template_uri=getattr(content, "blob") or None,
                             user_identity=user,
                             meta_data=meta_data,
+                            resource_obj=resource_db,
+                            gateway_obj=resource_db_gateway,
                         )
-                        setattr(content, "blob", resource_response)
+                        if resource_response:
+                            setattr(content, "blob", resource_response)
                     elif hasattr(content, "text"):
                         resource_response = await self.invoke_resource(
                             db=db,
@@ -2288,17 +2301,30 @@ class ResourceService:
                             resource_template_uri=getattr(content, "text") or None,
                             user_identity=user,
                             meta_data=meta_data,
+                            resource_obj=resource_db,
+                            gateway_obj=resource_db_gateway,
                         )
-                        setattr(content, "text", resource_response)
-                    return content
+                        if resource_response:
+                            setattr(content, "text", resource_response)
                 # Normalize primitive types to ResourceContent
-                if isinstance(content, bytes):
-                    return ResourceContent(type="resource", id=str(resource_id), uri=original_uri, blob=content)
-                if isinstance(content, str):
-                    return ResourceContent(type="resource", id=str(resource_id), uri=original_uri, text=content)
+                elif isinstance(content, bytes):
+                    content = ResourceContent(type="resource", id=str(resource_id), uri=original_uri, blob=content)
+                elif isinstance(content, str):
+                    content = ResourceContent(type="resource", id=str(resource_id), uri=original_uri, text=content)
+                else:
+                    # Fallback to stringified content
+                    content = ResourceContent(type="resource", id=str(resource_id) or str(content.id), uri=original_uri or content.uri, text=str(content))
 
-                # Fallback to stringified content
-                return ResourceContent(type="resource", id=str(resource_id) or str(content.id), uri=original_uri or content.uri, text=str(content))
+                # ═══════════════════════════════════════════════════════════════════════════
+                # POST-FETCH HOOKS: Now called AFTER content is resolved from gateway
+                # ═══════════════════════════════════════════════════════════════════════════
+                if has_post_fetch:
+                    post_payload = ResourcePostFetchPayload(uri=original_uri, content=content)
+                    post_result, _ = await self._plugin_manager.invoke_hook(ResourceHookType.RESOURCE_POST_FETCH, post_payload, global_context, contexts, violations_as_exceptions=True)
+                    if post_result.modified_payload:
+                        content = post_result.modified_payload.content
+
+                return content
             except Exception as e:
                 success = False
                 error_message = str(e)

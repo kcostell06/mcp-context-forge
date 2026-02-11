@@ -10,10 +10,10 @@
 [![Bandit Security](https://github.com/IBM/mcp-context-forge/actions/workflows/bandit.yml/badge.svg)](https://github.com/IBM/mcp-context-forge/actions/workflows/bandit.yml)&nbsp;
 [![Dependency Review](https://github.com/IBM/mcp-context-forge/actions/workflows/dependency-review.yml/badge.svg)](https://github.com/IBM/mcp-context-forge/actions/workflows/dependency-review.yml)&nbsp;
 [![Tests & Coverage](https://github.com/IBM/mcp-context-forge/actions/workflows/pytest.yml/badge.svg)](https://github.com/IBM/mcp-context-forge/actions/workflows/pytest.yml)&nbsp;
+[![Coverage %](docs/docs/images/coverage.svg)](https://ibm.github.io/mcp-context-forge/coverage/)&nbsp;
 [![Lint & Static Analysis](https://github.com/IBM/mcp-context-forge/actions/workflows/lint.yml/badge.svg)](https://github.com/IBM/mcp-context-forge/actions/workflows/lint.yml)
 
 <!-- === Container Build & Deploy === -->
-[![Secure Docker Build](https://github.com/IBM/mcp-context-forge/actions/workflows/docker-image.yml/badge.svg)](https://github.com/IBM/mcp-context-forge/actions/workflows/docker-image.yml)&nbsp;
 [![Deploy to IBM Code Engine](https://github.com/IBM/mcp-context-forge/actions/workflows/ibm-cloud-code-engine.yml/badge.svg)](https://github.com/IBM/mcp-context-forge/actions/workflows/ibm-cloud-code-engine.yml)
 
 <!-- === Package / Container === -->
@@ -432,8 +432,17 @@ docker compose exec gateway python3 -m mcpgateway.utils.create_jwt_token \
 make compose-tls
 
 # Access via HTTPS: https://localhost:8443/admin
-# Or use your own certificates:
-mkdir -p certs && cp your-cert.pem certs/cert.pem && cp your-key.pem certs/key.pem
+
+# Or bring your own certificates:
+# Unencrypted key:
+mkdir -p certs
+cp your-cert.pem certs/cert.pem && cp your-key.pem certs/key.pem
+make compose-tls
+
+# Passphrase-protected key:
+mkdir -p certs
+cp your-cert.pem certs/cert.pem && cp your-encrypted-key.pem certs/key-encrypted.pem
+echo "KEY_FILE_PASSWORD=your-passphrase" >> .env
 make compose-tls
 ```
 

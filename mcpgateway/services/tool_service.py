@@ -674,7 +674,15 @@ class ToolService:
 
         return False
 
-    def convert_tool_to_read(self, tool: DbTool, include_metrics: bool = False, include_auth: bool = True) -> ToolRead:
+    def convert_tool_to_read(
+        self,
+        tool: DbTool,
+        include_metrics: bool = False,
+        include_auth: bool = True,
+        requesting_user_email: Optional[str] = None,
+        requesting_user_is_admin: bool = False,
+        requesting_user_team_roles: Optional[Dict[str, str]] = None,
+    ) -> ToolRead:
         """Converts a DbTool instance into a ToolRead model, including aggregated metrics and
         new API gateway fields: request_type and authentication credentials (masked).
 
@@ -683,6 +691,9 @@ class ToolService:
             include_metrics (bool): Whether to include metrics in the result. Defaults to False.
             include_auth (bool): Whether to decode and include auth details. Defaults to True.
                 When False, skips expensive AES-GCM decryption and returns minimal auth info.
+            requesting_user_email (Optional[str]): Email of the requesting user for header masking.
+            requesting_user_is_admin (bool): Whether the requester is an admin.
+            requesting_user_team_roles (Optional[Dict[str, str]]): {team_id: role} for the requester.
 
         Returns:
             ToolRead: The Pydantic model representing the tool, including aggregated metrics and new fields.
@@ -726,12 +737,15 @@ class ToolService:
                 }
             elif tool.auth_type == "authheaders":
                 # Get first key
-                first_key = next(iter(decoded_auth_value))
-                tool_dict["auth"] = {
-                    "auth_type": "authheaders",
-                    "auth_header_key": first_key,
-                    "auth_header_value": settings.masked_auth_value if decoded_auth_value[first_key] else None,
-                }
+                if decoded_auth_value:
+                    first_key = next(iter(decoded_auth_value))
+                    tool_dict["auth"] = {
+                        "auth_type": "authheaders",
+                        "auth_header_key": first_key,
+                        "auth_header_value": settings.masked_auth_value if decoded_auth_value[first_key] else None,
+                    }
+                else:
+                    tool_dict["auth"] = None
             else:
                 tool_dict["auth"] = None
         elif not include_auth and has_encrypted_auth:
@@ -753,6 +767,24 @@ class ToolService:
         tool_dict["custom_name_slug"] = getattr(tool, "custom_name_slug", "") or ""
         tool_dict["tags"] = getattr(tool, "tags", []) or []
         tool_dict["team"] = getattr(tool, "team", None)
+
+        # Mask custom headers unless the requester is allowed to modify this tool.
+        # Safe default: if no requester context is provided, mask everything.
+        headers = tool_dict.get("headers")
+        if headers:
+            can_view = requesting_user_is_admin
+            if not can_view and getattr(tool, "owner_email", None) == requesting_user_email:
+                can_view = True
+            if (
+                not can_view
+                and getattr(tool, "visibility", None) == "team"
+                and getattr(tool, "team_id", None) is not None
+                and requesting_user_team_roles
+                and requesting_user_team_roles.get(str(tool.team_id)) == "owner"
+            ):
+                can_view = True
+            if not can_view:
+                tool_dict["headers"] = {k: settings.masked_auth_value for k in headers}
 
         return ToolRead.model_validate(tool_dict)
 
@@ -1176,7 +1208,7 @@ class ToolService:
 
             await admin_stats_cache.invalidate_tags()
 
-            return self.convert_tool_to_read(db_tool)
+            return self.convert_tool_to_read(db_tool, requesting_user_email=getattr(db_tool, "owner_email", None))
         except IntegrityError as ie:
             db.rollback()
             logger.error(f"IntegrityError during tool registration: {ie}")
@@ -1687,6 +1719,9 @@ class ToolService:
         visibility: Optional[str] = None,
         token_teams: Optional[List[str]] = None,
         _request_headers: Optional[Dict[str, str]] = None,
+        requesting_user_email: Optional[str] = None,
+        requesting_user_is_admin: bool = False,
+        requesting_user_team_roles: Optional[Dict[str, str]] = None,
     ) -> Union[tuple[List[ToolRead], Optional[str]], Dict[str, Any]]:
         """
         Retrieve a list of registered tools from the database with pagination support.
@@ -1710,6 +1745,9 @@ class ToolService:
                 where the token scope should be respected instead of the user's full team memberships.
             _request_headers (Optional[Dict[str, str]], optional): Headers from the request to pass through.
                 Currently unused but kept for API consistency. Defaults to None.
+            requesting_user_email (Optional[str]): Email of the requesting user for header masking.
+            requesting_user_is_admin (bool): Whether the requester is an admin.
+            requesting_user_team_roles (Optional[Dict[str, str]]): {team_id: role} for the requester.
 
         Returns:
             tuple[List[ToolRead], Optional[str]]: Tuple containing:
@@ -1736,7 +1774,15 @@ class ToolService:
         # - page-based pagination is used
         # This prevents cache poisoning where admin results could leak to public-only requests
         cache = _get_registry_cache()
-        if cursor is None and user_email is None and token_teams is None and page is None:
+        filters_hash = None
+        # Only use the cache when using the real converter. In unit tests we often patch
+        # convert_tool_to_read() to exercise error handling, and a warm cache would bypass it.
+        try:
+            converter_is_default = self.convert_tool_to_read.__func__ is ToolService.convert_tool_to_read  # type: ignore[attr-defined]
+        except Exception:
+            converter_is_default = False
+
+        if cursor is None and user_email is None and token_teams is None and page is None and converter_is_default:
             filters_hash = cache.hash_filters(include_inactive=include_inactive, tags=sorted(tags) if tags else None, gateway_id=gateway_id, limit=limit)
             cached = await cache.get("tools", filters_hash)
             if cached is not None:
@@ -1752,7 +1798,7 @@ class ToolService:
             query = query.where(DbTool.enabled)
         # Apply team-based access control if user_email is provided OR token_teams is explicitly set
         # This ensures unauthenticated requests with token_teams=[] only see public tools
-        if user_email or token_teams is not None:
+        if user_email is not None or token_teams is not None:  # empty-string user_email -> public-only filtering (secure default)
             # Use token_teams if provided (for MCP/API token access), otherwise look up from DB
             if token_teams is not None:
                 team_ids = token_teams
@@ -1832,7 +1878,16 @@ class ToolService:
         result = []
         for s in tools_db:
             try:
-                result.append(self.convert_tool_to_read(s, include_metrics=False, include_auth=False))
+                result.append(
+                    self.convert_tool_to_read(
+                        s,
+                        include_metrics=False,
+                        include_auth=False,
+                        requesting_user_email=requesting_user_email,
+                        requesting_user_is_admin=requesting_user_is_admin,
+                        requesting_user_team_roles=requesting_user_team_roles,
+                    )
+                )
             except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
                 logger.exception(f"Failed to convert tool {getattr(s, 'id', 'unknown')} ({getattr(s, 'name', 'unknown')}): {e}")
                 # Continue with remaining tools instead of failing completely
@@ -1850,7 +1905,7 @@ class ToolService:
 
         # Cache first page results - only for non-user-specific/non-scoped queries
         # Must match the same conditions as cache lookup to prevent cache poisoning
-        if cursor is None and user_email is None and token_teams is None:
+        if filters_hash is not None and cursor is None and user_email is None and token_teams is None and page is None and converter_is_default:
             try:
                 cache_data = {"tools": [s.model_dump(mode="json") for s in result], "next_cursor": next_cursor}
                 await cache.set("tools", cache_data, filters_hash)
@@ -1869,6 +1924,9 @@ class ToolService:
         user_email: Optional[str] = None,
         token_teams: Optional[List[str]] = None,
         _request_headers: Optional[Dict[str, str]] = None,
+        requesting_user_email: Optional[str] = None,
+        requesting_user_is_admin: bool = False,
+        requesting_user_team_roles: Optional[Dict[str, str]] = None,
     ) -> List[ToolRead]:
         """
         Retrieve a list of registered tools from the database.
@@ -1887,6 +1945,9 @@ class ToolService:
                 token access where the token scope should be respected.
             _request_headers (Optional[Dict[str, str]], optional): Headers from the request to pass through.
                 Currently unused but kept for API consistency. Defaults to None.
+            requesting_user_email (Optional[str]): Email of the requesting user for header masking.
+            requesting_user_is_admin (bool): Whether the requester is an admin.
+            requesting_user_team_roles (Optional[Dict[str, str]]): {team_id: role} for the requester.
 
         Returns:
             List[ToolRead]: A list of registered tools represented as ToolRead objects.
@@ -1929,7 +1990,7 @@ class ToolService:
 
         # Add visibility filtering if user context OR token_teams provided
         # This ensures unauthenticated requests with token_teams=[] only see public tools
-        if user_email or token_teams is not None:
+        if user_email is not None or token_teams is not None:  # empty-string user_email -> public-only filtering (secure default)
             # Use token_teams if provided (for MCP/API token access), otherwise look up from DB
             if token_teams is not None:
                 team_ids = token_teams
@@ -1962,7 +2023,16 @@ class ToolService:
         result = []
         for tool in tools:
             try:
-                result.append(self.convert_tool_to_read(tool, include_metrics=include_metrics, include_auth=False))
+                result.append(
+                    self.convert_tool_to_read(
+                        tool,
+                        include_metrics=include_metrics,
+                        include_auth=False,
+                        requesting_user_email=requesting_user_email,
+                        requesting_user_is_admin=requesting_user_is_admin,
+                        requesting_user_team_roles=requesting_user_team_roles,
+                    )
+                )
             except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
                 logger.exception(f"Failed to convert tool {getattr(tool, 'id', 'unknown')} ({getattr(tool, 'name', 'unknown')}): {e}")
                 # Continue with remaining tools instead of failing completely
@@ -2093,7 +2163,7 @@ class ToolService:
         result = []
         for tool in tools:
             try:
-                result.append(self.convert_tool_to_read(tool, include_metrics=False, include_auth=False))
+                result.append(self.convert_tool_to_read(tool, include_metrics=False, include_auth=False, requesting_user_email=user_email, requesting_user_is_admin=False))
             except (ValidationError, ValueError, KeyError, TypeError, binascii.Error) as e:
                 logger.exception(f"Failed to convert tool {getattr(tool, 'id', 'unknown')} ({getattr(tool, 'name', 'unknown')}): {e}")
                 # Continue with remaining tools instead of failing completely
@@ -2106,13 +2176,23 @@ class ToolService:
 
         return (result, next_cursor)
 
-    async def get_tool(self, db: Session, tool_id: str) -> ToolRead:
+    async def get_tool(
+        self,
+        db: Session,
+        tool_id: str,
+        requesting_user_email: Optional[str] = None,
+        requesting_user_is_admin: bool = False,
+        requesting_user_team_roles: Optional[Dict[str, str]] = None,
+    ) -> ToolRead:
         """
         Retrieve a tool by its ID.
 
         Args:
             db (Session): The SQLAlchemy database session.
             tool_id (str): The unique identifier of the tool.
+            requesting_user_email (Optional[str]): Email of the requesting user for header masking.
+            requesting_user_is_admin (bool): Whether the requester is an admin.
+            requesting_user_team_roles (Optional[Dict[str, str]]): {team_id: role} for the requester.
 
         Returns:
             ToolRead: The tool object.
@@ -2136,7 +2216,12 @@ class ToolService:
         if not tool:
             raise ToolNotFoundError(f"Tool not found: {tool_id}")
 
-        tool_read = self.convert_tool_to_read(tool)
+        tool_read = self.convert_tool_to_read(
+            tool,
+            requesting_user_email=requesting_user_email,
+            requesting_user_is_admin=requesting_user_is_admin,
+            requesting_user_team_roles=requesting_user_team_roles,
+        )
 
         structured_logger.log(
             level="INFO",
@@ -2428,7 +2513,7 @@ class ToolService:
                     db=db,
                 )
 
-            return self.convert_tool_to_read(tool)
+            return self.convert_tool_to_read(tool, requesting_user_email=getattr(tool, "owner_email", None))
         except PermissionError as e:
             # Structured logging: Log permission error
             structured_logger.log(
@@ -2820,6 +2905,18 @@ class ToolService:
                             gateway_auth_type=None,
                             gateway_passthrough_headers=None,  # REST tools don't use gateway auth here
                         )
+                        # Read MCP-Session-Id from downstream client (MCP protocol header)
+                        # and normalize to x-mcp-session-id for our internal session affinity logic
+                        # The pool will strip this before sending to upstream
+                        # Check both mcp-session-id (direct client) and x-mcp-session-id (forwarded requests)
+                        request_headers_lower = {k.lower(): v for k, v in request_headers.items()}
+                        mcp_session_id = request_headers_lower.get("mcp-session-id") or request_headers_lower.get("x-mcp-session-id")
+                        if mcp_session_id:
+                            headers["x-mcp-session-id"] = mcp_session_id
+
+                            worker_id = str(os.getpid())
+                            session_short = mcp_session_id[:8] if len(mcp_session_id) >= 8 else mcp_session_id
+                            logger.debug(f"[AFFINITY] Worker {worker_id} | Session {session_short}... | Tool: {name} | Normalized MCP-Session-Id → x-mcp-session-id for pool affinity")
 
                     if self._plugin_manager and self._plugin_manager.has_hooks_for(ToolHookType.TOOL_PRE_INVOKE):
                         # Use pre-created Pydantic model from Phase 2 (no ORM access)
@@ -2991,6 +3088,18 @@ class ToolService:
                         headers = compute_passthrough_headers_cached(
                             request_headers, headers, passthrough_allowed, gateway_auth_type=gateway_auth_type, gateway_passthrough_headers=gateway_passthrough
                         )
+                        # Read MCP-Session-Id from downstream client (MCP protocol header)
+                        # and normalize to x-mcp-session-id for our internal session affinity logic
+                        # The pool will strip this before sending to upstream
+                        # Check both mcp-session-id (direct client) and x-mcp-session-id (forwarded requests)
+                        request_headers_lower = {k.lower(): v for k, v in request_headers.items()}
+                        mcp_session_id = request_headers_lower.get("mcp-session-id") or request_headers_lower.get("x-mcp-session-id")
+                        if mcp_session_id:
+                            headers["x-mcp-session-id"] = mcp_session_id
+
+                            worker_id = str(os.getpid())
+                            session_short = mcp_session_id[:8] if len(mcp_session_id) >= 8 else mcp_session_id
+                            logger.debug(f"[AFFINITY] Worker {worker_id} | Session {session_short}... | Tool: {name} | Normalized MCP-Session-Id → x-mcp-session-id for pool affinity (MCP transport)")
 
                     def create_ssl_context(ca_certificate: str) -> ssl.SSLContext:
                         """Create an SSL context with the provided CA certificate.
@@ -3252,10 +3361,12 @@ class ToolService:
 
                             if use_pool and pool is not None:
                                 # Pooled path: do NOT add per-request headers (they would be pinned)
+                                # Determine transport type based on current transport setting
+                                pool_transport_type = TransportType.SSE if transport == "sse" else TransportType.STREAMABLE_HTTP
                                 async with pool.session(
                                     url=server_url,
                                     headers=headers,
-                                    transport_type=TransportType.STREAMABLE_HTTP,
+                                    transport_type=pool_transport_type,
                                     httpx_client_factory=get_httpx_client_factory,
                                     user_identity=app_user_email,
                                     gateway_id=gateway_id_str,
@@ -3417,7 +3528,15 @@ class ToolService:
                         params = None
                         if isinstance(arguments, dict) and "query" in arguments and isinstance(arguments["query"], str):
                             message_id = f"admin-test-{int(time.time())}"
-                            params = {"message": {"messageId": message_id, "role": "user", "parts": [{"type": "text", "text": arguments["query"]}]}}
+                            # A2A v0.3.x: message.parts use "kind" (not "type").
+                            params = {
+                                "message": {
+                                    "kind": "message",
+                                    "messageId": message_id,
+                                    "role": "user",
+                                    "parts": [{"kind": "text", "text": arguments["query"]}],
+                                }
+                            }
                             method = arguments.get("method", "message/send")
                         else:
                             params = arguments.get("params", arguments) if isinstance(arguments, dict) else arguments
@@ -3866,7 +3985,7 @@ class ToolService:
 
             await admin_stats_cache.invalidate_tags()
 
-            return self.convert_tool_to_read(tool)
+            return self.convert_tool_to_read(tool, requesting_user_email=getattr(tool, "owner_email", None))
         except PermissionError as pe:
             db.rollback()
 
@@ -4486,7 +4605,15 @@ class ToolService:
             if isinstance(parameters, dict) and "query" in parameters and isinstance(parameters["query"], str):
                 # Build the nested message object for JSONRPC protocol
                 message_id = f"admin-test-{int(time.time())}"
-                params = {"message": {"messageId": message_id, "role": "user", "parts": [{"type": "text", "text": parameters["query"]}]}}
+                # A2A v0.3.x: message.parts use "kind" (not "type").
+                params = {
+                    "message": {
+                        "kind": "message",
+                        "messageId": message_id,
+                        "role": "user",
+                        "parts": [{"kind": "text", "text": parameters["query"]}],
+                    }
+                }
                 method = parameters.get("method", "message/send")
             else:
                 # Already in correct format or unknown, pass through

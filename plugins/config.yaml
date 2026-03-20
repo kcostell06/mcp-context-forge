@@ -1016,3 +1016,19 @@ plugins:
       performance:
         timeout_ms: 1000
         parallel_evaluation: true
+
+  # Policy Templates Library - pre-built compliance-ready policy templates
+  - name: "PolicyTemplateLibrary"
+    kind: "plugins.policy_templates.policy_templates.PolicyTemplateLibraryPlugin"
+    description: "Pre-built compliance-ready policy templates library for HIPAA, PCI-DSS, SOX, GDPR, RBAC, ABAC, and MCP-specific access control"
+    version: "0.1.0"
+    author: "ContextForge Security Team"
+    hooks: ["startup"]
+    tags: ["policy", "templates", "compliance", "hipaa", "pci-dss", "gdpr", "sox", "rbac", "abac", "mcp"]
+    mode: "disabled"
+    priority: 90
+    config:
+      template_dirs:
+        - "plugins/policy_templates/templates"
+      validate_on_instantiate: true
+      run_tests_before_deploy: true
